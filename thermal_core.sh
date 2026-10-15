@@ -22,55 +22,91 @@ json_get() {
         | tr -d '", ' | tr -d ',' | tail -1
 }
 
-# ── 旧版验证有效的底层机制 ──────────────────────────────
+# ── 云温控覆盖：仅管理本模块创建的文件 ─────────────────
 
-# 确保/data/vendor/thermal目录存在且SELinux context正确
+OVERLAY_DIR="$CONFDIR/overlays"
+
 ensure_thermal_dir() {
-    chattr -R -i -a '/data/vendor/thermal' 2>/dev/null
-    if [ ! -d '/data/vendor/thermal/config' ]; then
-        rm -f '/data/vendor/thermal/config'
-        if [ ! -d '/data/vendor/thermal' ]; then
-            chattr -i -a '/data/vendor' 2>/dev/null
-            rm -f '/data/vendor/thermal'
-        fi
-        mkdir -p '/data/vendor/thermal/config'
+    [ -d "$THERMAL_PATH" ] || {
+        log "未找到云温控目录: $THERMAL_PATH"
+        return 1
+    }
+}
+
+# 首次覆盖时备份数据目录已有文件，卸载/关闭后恢复。
+backup_overlay() {
+    local name="$1"
+    case "$name" in thermal-normal.conf|thermal-map.conf) ;; *) return 1 ;; esac
+    mkdir -p "$OVERLAY_DIR" || return 1
+    [ -f "$OVERLAY_DIR/$name.state" ] && return 0
+    if [ -e "$THERMAL_PATH/$name" ]; then
+        cp -p "$THERMAL_PATH/$name" "$OVERLAY_DIR/$name.bak" || return 1
+        echo backup > "$OVERLAY_DIR/$name.state"
+    else
+        echo absent > "$OVERLAY_DIR/$name.state"
     fi
-    chown -R root:system '/data/vendor/thermal'
-    chcon -R 'u:object_r:thermal_data_file:s0' '/data/vendor/thermal'
-    chmod -R 0771 '/data/vendor/thermal'
 }
 
-# 清空云温控配置目录
-delete_conf() {
-    chattr -R -i -a '/data/vendor/thermal' 2>/dev/null
-    rm -rf /data/vendor/thermal/config/*
+write_overlay() {
+    local src="$1" name="$2"
+    [ -f "$src" ] || return 1
+    backup_overlay "$name" || return 1
+    cp "$src" "$THERMAL_PATH/$name" || return 1
+    chown root:system "$THERMAL_PATH/$name" 2>/dev/null
+    chcon u:object_r:thermal_data_file:s0 "$THERMAL_PATH/$name" 2>/dev/null
+    chmod 0644 "$THERMAL_PATH/$name"
 }
 
-# 重启温控进程使配置生效
-start_thermal_program() {
-    chown -R root:system '/data/vendor/thermal'
-    chcon -R 'u:object_r:thermal_data_file:s0' '/data/vendor/thermal'
-    chmod -R 0771 '/data/vendor/thermal'
-    stop "$THERMAL_DAEMON" 2>/dev/null
-    sleep 1
-    start "$THERMAL_DAEMON" 2>/dev/null
-    sleep 1
-    # mi_thermald重启后会重置充电电流，立即恢复到最大值
-    local max_c=$(json_get "max_charge_current")
-    [ -z "$max_c" ] || [ "$max_c" = "0" ] && max_c=22000000
-    [ "$(cat $CONFDIR/bypass_active 2>/dev/null)" != "1" ] && set_charge_current "$max_c"
-    log "重启温控进程: $THERMAL_DAEMON"
+has_overlays() {
+    [ -f "$OVERLAY_DIR/thermal-normal.conf.state" ] ||
+    [ -f "$OVERLAY_DIR/thermal-map.conf.state" ]
 }
 
-# 写入thermal-map文件（使用/system/vendor/etc路径，与mi_thermald一致）
-write_map_files() {
-    local thermal_list=$(cat "$MODDIR/thermal_list" 2>/dev/null \
-        | grep -i 'thermal-' | grep -i '\-map' | grep -iv '\-region\-map')
-    for i in $thermal_list; do
-        if [ -f "/system/vendor/etc/$i" ]; then
-            cp "$MODDIR/t_map" "/data/vendor/thermal/config/$i"
-        fi
+restore_overlays() {
+    local state name status
+    for name in thermal-normal.conf thermal-map.conf; do
+        state="$OVERLAY_DIR/$name.state"
+        [ -f "$state" ] || continue
+        status=$(cat "$state" 2>/dev/null)
+        case "$status" in
+            backup)
+                [ -f "$OVERLAY_DIR/$name.bak" ] || {
+                    log "无法恢复 $name：备份缺失"; return 1
+                }
+                cp -p "$OVERLAY_DIR/$name.bak" "$THERMAL_PATH/$name" || return 1
+                chcon u:object_r:thermal_data_file:s0 "$THERMAL_PATH/$name" 2>/dev/null
+                ;;
+            absent)
+                rm -f "$THERMAL_PATH/$name" || return 1
+                ;;
+            *) log "覆盖状态异常: $name"; return 1 ;;
+        esac
+        rm -f "$state" "$OVERLAY_DIR/$name.bak"
     done
+}
+
+# K50 使用原厂 mi_thermald 服务重载加密配置。
+start_thermal_program() {
+    stop "$THERMAL_DAEMON" 2>/dev/null || return 1
+    sleep 1
+    start "$THERMAL_DAEMON" 2>/dev/null || return 1
+    sleep 1
+    log "重启温控服务: $THERMAL_DAEMON"
+}
+
+write_map_files() {
+    [ -f /vendor/etc/thermal-map.conf ] ||
+        [ -f /system/vendor/etc/thermal-map.conf ] || return 1
+    write_overlay "$MODDIR/t_map" thermal-map.conf
+}
+
+apply_profile() {
+    write_overlay "$1" thermal-normal.conf || return 1
+    if ! write_map_files; then
+        restore_overlays
+        return 1
+    fi
+    start_thermal_program
 }
 
 # ── 温控模式应用 ──────────────────────────────────────
@@ -81,11 +117,9 @@ update_status() {
 
 # 应用零档（完全无限制）：使用t_blank文件
 apply_unlimited() {
-    local cur_md5=$(md5sum "/data/vendor/thermal/config/thermal-normal.conf" 2>/dev/null | cut -d' ' -f1)
+    local cur_md5=$(md5sum "$THERMAL_PATH/thermal-normal.conf" 2>/dev/null | cut -d' ' -f1)
     if [ "$cur_md5" != "$MD5_BLANK" ]; then
-        cp "$MODDIR/t_blank" "/data/vendor/thermal/config/thermal-normal.conf"
-        write_map_files
-        start_thermal_program
+        apply_profile "$MODDIR/t_blank" || { log "零档应用失败"; return 1; }
     fi
     local current_mode=$(cat "$CONFDIR/current_mode" 2>/dev/null)
     if [ "$current_mode" != "unlimited" ]; then
@@ -102,15 +136,13 @@ apply_level() {
     local mode_id="level_${lvl}"
     local conf_size=$(wc -c < "$conf" 2>/dev/null || echo 0)
     if [ "$conf_size" -lt 100 ]; then
-        apply_unlimited
-        return
+        log "无效的档位文件: $conf"
+        return 1
     fi
-    local cur_md5=$(md5sum "/data/vendor/thermal/config/thermal-normal.conf" 2>/dev/null | cut -d' ' -f1)
+    local cur_md5=$(md5sum "$THERMAL_PATH/thermal-normal.conf" 2>/dev/null | cut -d' ' -f1)
     local target_md5=$(md5sum "$conf" | cut -d' ' -f1)
     if [ "$cur_md5" != "$target_md5" ]; then
-        cp "$conf" "/data/vendor/thermal/config/thermal-normal.conf"
-        write_map_files
-        start_thermal_program
+        apply_profile "$conf" || { log "档位 $lvl 应用失败"; return 1; }
     fi
     local current_mode=$(cat "$CONFDIR/current_mode" 2>/dev/null)
     if [ "$current_mode" != "$mode_id" ]; then
@@ -122,12 +154,9 @@ apply_level() {
 
 # 应用旁路供电温控（使用t_bypass_0文件）
 apply_bypass_thermal() {
-    local cur_md5=$(md5sum "/data/vendor/thermal/config/thermal-normal.conf" 2>/dev/null | cut -d' ' -f1)
+    local cur_md5=$(md5sum "$THERMAL_PATH/thermal-normal.conf" 2>/dev/null | cut -d' ' -f1)
     if [ "$cur_md5" != "$MD5_BYPASS_0" ] && [ "$cur_md5" != "$MD5_BYPASS_1" ]; then
-        cp "$MODDIR/t_bypass_0" "/data/vendor/thermal/config/thermal-normal.conf"
-        write_map_files
-        stat_decrypt_1=$(stat -c %Y '/data/vendor/thermal/decrypt.txt' 2>/dev/null)
-        start_thermal_program
+        apply_profile "$MODDIR/t_bypass_0" || { log "旁路档位应用失败"; return 1; }
     fi
     local current_mode=$(cat "$CONFDIR/current_mode" 2>/dev/null)
     if [ "$current_mode" != "bypass" ]; then
@@ -137,14 +166,14 @@ apply_bypass_thermal() {
     fi
 }
 
-# 恢复系统默认温控（清空云温控目录）
+# 恢复默认：只还原本模块覆盖的文件
 apply_default() {
     local current_mode=$(cat "$CONFDIR/current_mode" 2>/dev/null)
-    local config_files=$(ls -A /data/vendor/thermal/config/ 2>/dev/null)
-    if [ -n "$config_files" ] || [ "$current_mode" != "default" ]; then
-        delete_conf
-        stat_decrypt_1=$(stat -c %Y '/data/vendor/thermal/decrypt.txt' 2>/dev/null)
-        start_thermal_program
+    if has_overlays; then
+        restore_overlays || return 1
+        start_thermal_program || return 1
+    fi
+    if [ "$current_mode" != "default" ]; then
         echo "default" > "$CONFDIR/current_mode"
         update_status "系统默认"
         log "切换: 系统默认"
@@ -154,7 +183,7 @@ apply_default() {
 # 根据模式ID分发
 apply_mode() {
     local mode="$1"
-    ensure_thermal_dir
+    ensure_thermal_dir || return 1
     case "$mode" in
         unlimited) apply_unlimited ;;
         level_1)   apply_level 1 ;;
@@ -171,32 +200,29 @@ apply_mode() {
 
 set_charge_current() {
     local target="$1"
-    # 优先使用检测到的主节点
-    if [ -n "$CHARGE_NODE" ] && [ -f "$CHARGE_NODE" ]; then
-        chmod 0644 "$CHARGE_NODE" 2>/dev/null
-        echo "$target" > "$CHARGE_NODE" 2>/dev/null
-    fi
-    # 备用节点
-    for node in /sys/class/power_supply/battery/constant_charge_current_max \
-                /sys/class/power_supply/battery/charge_control_limit; do
-        if [ "$node" != "$CHARGE_NODE" ] && [ -f "$node" ] && [ -w "$node" ]; then
-            echo "$target" > "$node" 2>/dev/null
-        fi
-    done
+    # K50 的 CHARGE_NODE 为空；绝不把微安数值写入充电档位节点。
+    [ -n "$CHARGE_NODE" ] && [ -w "$CHARGE_NODE" ] || return 1
+    case "$CHARGE_NODE" in
+        /sys/class/xm_power/charger/charger_thermal/wired_chg_curr|\
+        /sys/class/power_supply/battery/constant_charge_current_max)
+            printf '%s\n' "$target" > "$CHARGE_NODE"
+            ;;
+        *) return 1 ;;
+    esac
 }
 
 # ── 旁路供电控制 ──────────────────────────────────────
 
 bypass_on() {
-    set_charge_current 0
-    apply_bypass_thermal
+    set_charge_current 0 || return 1
+    apply_bypass_thermal || return 1
     echo "1" > "$CONFDIR/bypass_active"
 }
 
 bypass_off() {
     local max_c=$(json_get "max_charge_current")
     [ -z "$max_c" ] || [ "$max_c" = "0" ] && max_c=22000000
-    set_charge_current "$max_c"
+    [ -n "$CHARGE_NODE" ] && set_charge_current "$max_c"
     rm -f "$CONFDIR/bypass_active"
     rm -f "$CONFDIR/bypass_trigger"
 }
@@ -261,9 +287,12 @@ if [ "$thermal_map_n" = "0" ]; then
     exit 1
 fi
 
-ensure_thermal_dir
-delete_conf
-rm -f "$CONFDIR/current_mode"
+ensure_thermal_dir || exit 1
+if has_overlays; then
+    restore_overlays || exit 1
+    start_thermal_program || exit 1
+fi
+rm -f "$CONFDIR/current_mode" "$CONFDIR/bypass_active" "$CONFDIR/bypass_trigger" "$CONFDIR/bypass_manual"
 log "thermal_core 启动 daemon=$THERMAL_DAEMON"
 
 # ── 主循环 ────────────────────────────────────────────
@@ -319,7 +348,7 @@ while true; do
     BYPASS_TRIGGER=$(cat "$CONFDIR/bypass_trigger" 2>/dev/null)
 
     # ── 旁路供电优先级最高 ──
-    if [ "$IS_CHARGING" = "1" ]; then
+    if [ "$IS_CHARGING" = "1" ] && [ -n "$CHARGE_NODE" ]; then
         BYPASS_TEMP_ON=$(json_get "bypass_temp_on")
         BYPASS_TEMP_OFF=$(json_get "bypass_temp_off")
         BYPASS_LEVEL=$(json_get "bypass_level")
@@ -365,7 +394,7 @@ while true; do
 
             # 游戏旁路
             GAME_BYPASS=$(json_get "game_bypass")
-            [ "$GAME_BYPASS" = "true" ] && [ "$IS_CHARGING" = "1" ] && bypass_on
+            [ "$GAME_BYPASS" = "true" ] && [ "$IS_CHARGING" = "1" ] && [ -n "$CHARGE_NODE" ] && bypass_on
 
             # 锁帧
             GAME_FPS=$(json_get "game_fps")
@@ -413,7 +442,7 @@ while true; do
 
         # 功率/电流限制（旁路时不限制，每轮强制写入防止mi_thermald覆盖）
         CURRENT_LIMIT=$(json_get "current_limit")
-        if [ -n "$CURRENT_LIMIT" ] && [ "$CURRENT_LIMIT" -gt 0 ] 2>/dev/null; then
+        if [ -n "$CHARGE_NODE" ] && [ -n "$CURRENT_LIMIT" ] && [ "$CURRENT_LIMIT" -gt 0 ] 2>/dev/null; then
             [ "$BYPASS_ACTIVE" != "1" ] && set_charge_current "$CURRENT_LIMIT"
         fi
     else
