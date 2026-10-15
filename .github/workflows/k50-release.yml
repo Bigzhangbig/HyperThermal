@@ -1,0 +1,107 @@
+name: K50 research release
+
+on:
+  push:
+    branches:
+      - research
+    tags:
+      - 'v*-k50-research.*'
+    paths:
+      - '.github/workflows/k50-release.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: github.repository == 'Bigzhangbig/HyperThermal'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Validate module and scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(
+            module.prop customize.sh service.sh thermal_core.sh action.sh
+            uninstall.sh default_settings.json t_map t_blank t_bypass_0 t_bypass_1
+          )
+          for file in "${files[@]}"; do
+            test -f "$file" || { echo "::error::Missing $file"; exit 1; }
+          done
+          test -d webroot && test -d thermal
+          for script in customize.sh service.sh thermal_core.sh action.sh uninstall.sh; do
+            sh -n "$script"
+          done
+          python3 -m json.tool default_settings.json > /dev/null
+          grep -q '^id=HyperThermal$' module.prop
+          grep -q '^version=v1.0.1-k50-research.1$' module.prop
+          # Do not permit the unsafe generic current-limit fallback on rubens.
+          ! grep -q 'battery/charge_control_limit' thermal_core.sh
+          ! grep -q 'rm -rf /data/vendor/thermal/config' thermal_core.sh
+
+      - name: Package KernelSU module
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            # One-time bootstrap when the workflow is first committed to research.
+            tag="v1.0.1-k50-research.1"
+          fi
+          name="HyperThermal-K50-${tag}.zip"
+          mkdir -p dist
+          zip -q -r -9 "dist/$name" \
+            module.prop customize.sh service.sh thermal_core.sh \
+            action.sh uninstall.sh default_settings.json \
+            t_map t_blank t_bypass_0 t_bypass_1 webroot thermal
+          unzip -Z1 "dist/$name" | grep -qx 'module.prop'
+          unzip -Z1 "dist/$name" | grep -qx 'service.sh'
+          unzip -Z1 "dist/$name" | grep -qx 'thermal_core.sh'
+          (cd dist && sha256sum "$name" > "$name.sha256")
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "asset=dist/$name" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/$name.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Create Tag and prerelease with ZIP assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.package.outputs.tag }}
+          ZIP_ASSET: ${{ steps.package.outputs.asset }}
+          SHA_ASSET: ${{ steps.package.outputs.checksum }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; not rewriting its assets."
+            exit 0
+          fi
+          cat > release-notes.md <<'NOTES'
+          ### Redmi K50 / HyperOS 2 (research prerelease)
+
+          - Target device: rubens, HyperOS 2.0.10.0.ULNCNXM, Android 14, KernelSU.
+          - Fix detection of the vendor mi_thermald service.
+          - Keep upstream encrypted thermal levels and WebUI.
+          - Scope cloud thermal overrides to the files managed by this module.
+          - Disable unverified direct current-limit and bypass controls on K50.
+          - Default to no thermal intervention until manually enabled.
+
+          This is an experimental build; the device has not yet been used to validate the module.
+          It does not fix USB-PD or Xiaomi private fast-charging negotiations.
+
+          Install the attached **HyperThermal-K50-*.zip** using KernelSU; do not install
+          GitHub's automatic "Source code (zip)" archive, which is not a module package.
+          NOTES
+          gh release create "$RELEASE_TAG" "$ZIP_ASSET" "$SHA_ASSET" \
+            --target "$GITHUB_SHA" \
+            --title "HyperThermal K50 research ${RELEASE_TAG}" \
+            --notes-file release-notes.md \
+            --prerelease \
+            --latest=false
+          gh release view "$RELEASE_TAG" --json url,tagName,isPrerelease,assets \
+            --jq '{url,tag: .tagName,prerelease: .isPrerelease,assets: [.assets[].name]}'
