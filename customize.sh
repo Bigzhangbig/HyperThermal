@@ -7,9 +7,9 @@ ui_print "  适配 HyperOS 全版本"
 ui_print "=============================="
 
 # 检测温控进程
-if which mi_thermald >/dev/null 2>&1; then
+if [ -x /vendor/bin/mi_thermald ]; then
     ui_print "- 检测到 mi_thermald"
-elif which thermal-engine >/dev/null 2>&1; then
+elif [ -x /vendor/bin/thermal-engine ]; then
     ui_print "- 检测到 thermal-engine"
 else
     ui_print "! 未检测到温控进程，模块可能无法工作"
