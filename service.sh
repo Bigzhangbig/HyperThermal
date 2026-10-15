@@ -11,9 +11,9 @@ mkdir -p "$CONFDIR"
 
 # 检测温控进程
 THERMAL_DAEMON=""
-if [ -f "$(which mi_thermald 2>/dev/null)" ] && pgrep mi_thermald >/dev/null 2>&1; then
+if [ -x /vendor/bin/mi_thermald ] && [ "$(getprop init.svc.mi_thermald)" = "running" ]; then
     THERMAL_DAEMON="mi_thermald"
-elif [ -f "$(which thermal-engine 2>/dev/null)" ] && pgrep thermal-engine >/dev/null 2>&1; then
+elif [ -x /vendor/bin/thermal-engine ] && [ "$(getprop init.svc.thermal-engine)" = "running" ]; then
     THERMAL_DAEMON="thermal-engine"
 fi
 
@@ -23,28 +23,29 @@ if [ -z "$THERMAL_DAEMON" ]; then
 fi
 
 # 检测云温控路径
-if [ -d "/data/vendor/thermal/config" ] || [ ! -d "/data/thermal/config" ]; then
+if [ -d "/data/vendor/thermal/config" ]; then
     THERMAL_PATH="/data/vendor/thermal/config"
 else
     THERMAL_PATH="/data/thermal/config"
 fi
 
-# 检测充电电流控制节点（按优先级）
+# K50/rubens 的 charge_control_limit 是档位，不能写入微安数值。
+# 未确认适配的 K50 电流节点不参与控制。
 CHARGE_NODE=""
-for n in /sys/class/xm_power/charger/charger_thermal/wired_chg_curr \
-         /sys/class/power_supply/battery/constant_charge_current_max \
-         /sys/class/power_supply/battery/charge_control_limit; do
-    if [ -f "$n" ] && [ -w "$n" ]; then
-        CHARGE_NODE="$n"
-        break
-    fi
-done
+if [ "$(getprop ro.product.device)" != "rubens" ]; then
+    for n in /sys/class/xm_power/charger/charger_thermal/wired_chg_curr \
+             /sys/class/power_supply/battery/constant_charge_current_max; do
+        if [ -f "$n" ] && [ -w "$n" ]; then
+            CHARGE_NODE="$n"
+            break
+        fi
+    done
+fi
 
 # 用独立文件传递运行时参数（避免eval注入）
 printf '%s' "$THERMAL_DAEMON" > "$CONFDIR/rt_thermal_daemon"
 printf '%s' "$THERMAL_PATH"   > "$CONFDIR/rt_thermal_path"
 printf '%s' "$CHARGE_NODE"    > "$CONFDIR/rt_charge_node"
-printf '%s' "$VOLTAGE_NODE"   > "$CONFDIR/rt_voltage_node"
 
 # 获取商品名（优先marketname，其次model）
 MARKET_NAME=$(getprop ro.product.marketname 2>/dev/null)
@@ -56,6 +57,8 @@ for vn in /sys/class/power_supply/battery/voltage_now \
           /sys/class/power_supply/battery/voltage_ocv; do
     if [ -f "$vn" ]; then VOLTAGE_NODE="$vn"; break; fi
 done
+
+printf '%s' "$VOLTAGE_NODE" > "$CONFDIR/rt_voltage_node"
 
 # 写runtime.json供WebUI读取
 printf '{"thermal_daemon":"%s","os_version":"%s","thermal_path":"%s","charge_node":"%s","voltage_node":"%s","platform":"%s","model":"%s","market_name":"%s"}\n' \
