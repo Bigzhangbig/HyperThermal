@@ -415,7 +415,7 @@ select { appearance: none; }
 
 <script>
 const MODDIR='/data/adb/modules/HyperThermal', CONF=MODDIR+'/config/settings.json';
-let settings={}, gameApps=[];
+let settings={}, gameApps=[], chargeControlAvailable=false;
 
 const LEVELS=[{id:'unlimited',l:'无限制'},{id:'level_1',l:'一档'},{id:'level_2',l:'二档'},{id:'level_3',l:'三档'},{id:'level_4',l:'四档'},{id:'level_5',l:'五档'}];
 const MODES=[{id:'default',l:'系统默认'},...LEVELS];
@@ -447,8 +447,8 @@ function renderPowerGrid(){
   const cur=settings.power_limit_w||0;
   document.getElementById('powerGrid').innerHTML=POWERS.map(p=>`<div class="chip${cur===p.w?' active':''}" onclick="selectPower(${p.w})">${p.l}</div>`).join('');
 }
-function selectPower(w){settings.power_limit_w=w;renderPowerGrid();updatePowerSub();save();}
-function updatePowerSub(){const w=settings.power_limit_w||0;document.getElementById('powerSub').textContent=w?`限制 ${w}W`:'不限制';}
+function selectPower(w){if(!chargeControlAvailable){toast('本设备不支持直接电流控制');return;}settings.power_limit_w=w;renderPowerGrid();updatePowerSub();save();}
+function updatePowerSub(){const w=settings.power_limit_w||0;document.getElementById('powerSub').textContent=!chargeControlAvailable?'电流控制不可用':w?`限制 ${w}W`:'不限制';}
 
 // ── Game Apps ──
 function renderGameApps(){
@@ -460,7 +460,7 @@ function addApp(){const input=document.getElementById('newApp'),p=input.value.tr
 function removeApp(i){gameApps.splice(i,1);renderGameApps();save();}
 
 // ── Bypass ──
-async function toggleBypass(){const on=document.getElementById('bypass_manual').checked;await exec(`printf '%s' '${on?1:0}' > ${MODDIR}/config/bypass_manual`);toast(on?'旁路已开启':'旁路已关闭');}
+async function toggleBypass(){if(!chargeControlAvailable){document.getElementById('bypass_manual').checked=false;toast('本设备不支持旁路控制');return;}const on=document.getElementById('bypass_manual').checked;await exec(`printf '%s' '${on?1:0}' > ${MODDIR}/config/bypass_manual`);toast(on?'旁路已开启':'旁路已关闭');}
 
 // ── Subs ──
 function updateSubs(){
@@ -488,7 +488,8 @@ async function save(){
   settings.time_end=parseInt(document.getElementById('time_end').value)||0;
   settings.time_level=document.getElementById('time_level').value;
   settings.game_apps=gameApps.join('|');
-  settings.current_limit=(POWERS.find(p=>p.w===settings.power_limit_w)||{ua:0}).ua||0;
+  settings.current_limit=chargeControlAvailable?((POWERS.find(p=>p.w===settings.power_limit_w)||{ua:0}).ua||0):0;
+  if(!chargeControlAvailable){settings.game_bypass=false;settings.bypass_temp_on=0;settings.bypass_temp_off=0;settings.bypass_level=0;settings.max_charge_current=0;settings.power_limit_w=0;}
 
   const lines=['{',
     `  "enabled": ${settings.enabled},`,`  "charge_mode": ${settings.charge_mode},`,
@@ -535,8 +536,17 @@ async function load(){
   const bp=await exec(`cat ${MODDIR}/config/bypass_manual 2>/dev/null`);
   document.getElementById('bypass_manual').checked=bp.stdout.trim()==='1';
   const rt=await exec(`cat ${MODDIR}/config/runtime.json 2>/dev/null`);
-  if(rt.stdout.trim())try{const i=JSON.parse(rt.stdout.trim());document.getElementById('deviceName').textContent=`${i.market_name||i.model} · HyperOS ${i.os_version}`}catch(e){}
+  if(rt.stdout.trim())try{
+    const i=JSON.parse(rt.stdout.trim());
+    document.getElementById('deviceName').textContent=`${i.market_name||i.model} · HyperOS ${i.os_version}`;
+    chargeControlAvailable=!!i.charge_node;
+  }catch(e){}
+  if(!chargeControlAvailable){
+    ['game_bypass','bypass_manual','bypass_temp_on','bypass_temp_off','bypass_level','max_charge_current'].forEach(id=>document.getElementById(id).disabled=true);
+    document.getElementById('bypassSub').textContent='本设备暂不支持旁路';
+  }
   updateSubs();
+  if(!chargeControlAvailable)document.getElementById('bypassSub').textContent='本设备暂不支持旁路';
 }
 
 // ── Refresh ──
