@@ -1,6 +1,6 @@
 id=HyperThermal
 name=HyperThermal - 动态温控
-version=v1.0.1-k50-research
+version=v1.0.1-k50-research.1
 versionCode=101
 author=Laros&top大佬
 description=[ 状态：初始化中 ] Redmi K50/HyperOS2 适配研究版，保留温控切换；K50 电流写入及旁路暂不可用
