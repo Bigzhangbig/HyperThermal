@@ -201,6 +201,7 @@ apply_mode() {
 set_charge_current() {
     local target="$1"
     # K50 的 CHARGE_NODE 为空；绝不把微安数值写入充电档位节点。
+    [ "$(getprop ro.product.device)" != "rubens" ] || return 1
     [ -n "$CHARGE_NODE" ] && [ -w "$CHARGE_NODE" ] || return 1
     case "$CHARGE_NODE" in
         /sys/class/xm_power/charger/charger_thermal/wired_chg_curr|\
@@ -277,8 +278,10 @@ fi
 
 # 构建thermal_list（使用/system/vendor/etc，与mi_thermald一致）
 rm -f "$MODDIR/thermal_list"
-find /system/vendor/etc -type f -iname "thermal*.conf" \
-    | sed 's|/system/vendor/etc/||' | grep -v '/' > "$MODDIR/thermal_list"
+VENDOR_ETC=/vendor/etc
+[ -d /system/vendor/etc ] && VENDOR_ETC=/system/vendor/etc
+find "$VENDOR_ETC" -type f -iname "thermal*.conf" \
+    | sed "s|$VENDOR_ETC/||" | grep -v '/' > "$MODDIR/thermal_list"
 
 thermal_map_n=$(grep -i 'thermal-' "$MODDIR/thermal_list" 2>/dev/null \
     | grep -i '\-map' | grep -iv '\-region\-map' | wc -l)
